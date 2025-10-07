@@ -4,6 +4,7 @@ import time
 import urandom
 from sound import Speaker
 from ota import OTAUpdater
+import uasyncio as asyncio
 
 # --- Setup ---
 i2c = I2C(0, scl=Pin(9), sda=Pin(8))
@@ -13,35 +14,32 @@ center = (0, 0)
 
 blink_timer = 0
 button_wink_timer = 0
-last_ota_check = time.ticks_ms()
 last_qr_time = time.ticks_ms()
 idle_start = time.ticks_ms()
 sleeping = False
-mood = 'idle'
+play = 0
+ok = 0
 
 qr = ssd1306_simple.BITMAP(oled)
 bat = ssd1306_simple.BITMAP(oled)
 
-update_available = False
+# --- OTA Setup ---
 ssid = "Rogers Pod"
 password = "W1toronto47"
 repo = "https://github.com/USER-1145-desgin/Viro-ota/"
 filename = "main.py"
 ota = OTAUpdater(ssid, password, repo, filename)
+update_available = False
 
-# --- Battery setup ---
+# --- Battery ---
 bat_adc = ADC(Pin(2))
 bat_adc.atten(ADC.ATTN_11DB)
 bat_adc.width(ADC.WIDTH_12BIT)
-R1 = 10000
-R2 = 10000
-V_MIN = 3.0
-V_MAX = 4.2
+R1, R2 = 10000, 10000
+V_MIN, V_MAX = 3.0, 4.2
 CALIBRATION = 3.2082202
 LOW_THRESHOLD = 20
 
-ok = 0
-play = 0
 transistor = Pin(21, Pin.OUT)
 sp = Speaker(pin=4)
 piano_keys = {
@@ -52,103 +50,118 @@ piano_keys = {
 
 # --- Functions ---
 def read_battery_voltage(samples=50):
-    total = 0
-    for _ in range(samples):
-        total += bat_adc.read()
+    total = sum(bat_adc.read() for _ in range(samples))
     adc_avg = total / samples
     voltage = (adc_avg / 4095) * 3.3
-    voltage = voltage * ((R1 + R2)/R2)
-    voltage = voltage * CALIBRATION
+    voltage = voltage * ((R1 + R2)/R2) * CALIBRATION
     return voltage
 
 def voltage_to_percent(voltage):
     percent = int((voltage - V_MIN) / (V_MAX - V_MIN) * 100)
     return max(0, min(percent, 100))
 
-# --- Main loop ---
-while True:
-    oled.fill(0)
-    now = time.ticks_ms()
-    voltage = read_battery_voltage()
-    percent = voltage_to_percent(voltage)
+CHECK_INTERVAL = 300  # seconds (5 minutes)
+OTA_RETRIES = 3       # retry count for failed OTA checks
 
-    # --- OTA check every 5 min ---
-    if time.ticks_diff(now, last_ota_check) > 300000:
-        if ota.check_for_updates():
-            update_available = True
-        last_ota_check = now
+async def ota_task(ota):
+    global update_available
+    while True:
+        for attempt in range(OTA_RETRIES):
+            try:
+                print("Checking OTA updates...")
+                if ota.check_for_updates():
+                    update_available = True
+                    print("New update available! Downloading...")
+                    # Only download and reset when ready
+                    ota.download_and_install_update_if_available()
+                else:
+                    print("No new updates.")
+                break  # success, exit retry loop
+            except OSError as e:
+                print(f"OTA check failed (attempt {attempt+1}/{OTA_RETRIES}):", e)
+                await asyncio.sleep(2)  # short wait before retry
+            except Exception as e:
+                print("Unexpected OTA error:", e)
+                break  # unexpected error, don't retry
 
-    # --- Battery status ---
-    if percent <= LOW_THRESHOLD:
-        print("Battery Voltage: {:.2f} V, Battery %: {}% - LOW BATTERY!".format(voltage, percent))
-        bat.show_picture('lowbat')
-        time.sleep(3)
-        deepsleep()
-    #else:
-        #print("Battery Voltage: {:.2f} V, Battery %: {}%".format(voltage, percent))
+        # Wait for the next OTA check
+        await asyncio.sleep(CHECK_INTERVAL)
 
-    # --- OTA display ---
-    if update_available:
-        oled.write("New update available!", 25, 0)
-        oled.write("Tap to update.", 40, 0)
+# --- Main loop task ---
+async def main_loop():
+    global blink_timer, button_wink_timer, idle_start, sleeping, last_qr_time, update_available, ok, play
+    while True:
+        oled.fill(0)
+        now = time.ticks_ms()
+        voltage = read_battery_voltage()
+        percent = voltage_to_percent(voltage)
 
-    # --- Button and mood ---
-    if button.value():
-        idle_start = now
-        sleeping = False
-        last_qr_time = now
-        mood = 'happy'
-        if update_available:
-            ota.update_and_reset()
-    else:
-        play = 0
-        ok = 0
-        mood = 'idle'
+        # --- Battery check ---
+        if percent <= LOW_THRESHOLD:
+            print(f"Battery {percent}% - LOW BATTERY!")
+            bat.show_picture('lowbat')
+            await asyncio.sleep(3)
+            deepsleep()
 
-    # --- Determine sleeping state ---
-    if time.ticks_diff(now, idle_start) > 20*60*1000:
-        sleeping = True
-
-    # --- Sleep animation ---
-    if sleeping:
-        oled.sleep_animation()
-    else:
-        # --- QR display every 15s ---
-        if time.ticks_diff(now, last_qr_time) >= 15000:
-            qr.show_QR()
-            last_qr_time = now
-            while True:
-                now = time.ticks_ms()
-                if button.value() or time.ticks_diff(now, last_qr_time) >= 10000:
-                    break
-            last_qr_time = now
-
-        # --- Wink / blink ---
-        if mood == 'happy':
-            oled.draw_half_circle_eye('left', layers=5, direction="up")
-            oled.draw_half_circle_eye('right', layers=5, direction="up")
-            
-            if button_wink_timer > 0:
-                button_wink_timer = max(button_wink_timer - 1, 0)
-            
-            # Play sound once
-            if play == 0 and ok == 0:
-                transistor.value(1)
-                sp.play_tone(piano_keys['C5'], 100)
-                transistor.value(0)
-                ok = 1
-
+        # --- Button handling ---
+        if button.value():
+            idle_start = now
+            sleeping = False
+            if button_wink_timer == 0:
+                button_wink_timer = 1
         else:
-            if urandom.getrandbits(4) == 0:
-                blink_timer = 1
-            if blink_timer > 0:
-                oled.draw_eye('left', blink=True)
-                oled.draw_eye('right', blink=True)
+            play = 0
+            ok = 0
+
+        # --- Sleeping state ---
+        sleeping = time.ticks_diff(now, idle_start) > 20*60*1000
+
+        # --- Sleep or QR display ---
+        if sleeping:
+            oled.sleep_animation()
+        else:
+            if time.ticks_diff(now, last_qr_time) >= 15000:
+                qr.show_QR()
+                last_qr_time = now
+                while True:
+                    
+                    now = time.ticks_ms()
+
+                    if button.value() or time.ticks_diff(now, last_qr_time) >= 10000:
+                        break
+                    else:
+                        pass
+                last_qr_time = now
+            
+            # --- Wink / blink ---
+            if button_wink_timer > 0:
+                oled.draw_half_circle_eye('left', layers=5, direction="up")
+                oled.draw_half_circle_eye('right', layers=5, direction="up")
+                button_wink_timer -= 1
+                if play == 0 and ok == 0:
+                    for key in ['C4', 'C5']:
+                        transistor.value(1)
+                        sp.play_tone(piano_keys[key], 100)
+                        transistor.value(0)
+                        ok = 1
             else:
-                oled.draw_eye('left', pupil_offset=center, height=2)
-                oled.draw_eye('right', pupil_offset=center, height=1)
-            blink_timer -= 1
+                if urandom.getrandbits(4) == 0:
+                    blink_timer = 1
+                if blink_timer > 0:
+                    oled.draw_eye('left', blink=True)
+                    oled.draw_eye('right', blink=True)
+                else:
+                    oled.draw_eye('left', pupil_offset=center, height=1)
+                    oled.draw_eye('right', pupil_offset=center, height=1)
+                blink_timer -= 1
 
-    oled.show()
-    time.sleep(0.01)
+        oled.show()
+        await asyncio.sleep(0.01)
 
+# --- Run both tasks concurrently ---
+async def main():
+    asyncio.create_task(ota_task(ota))  # start OTA in background
+    await main_loop()  # your existing main_loop() task
+ 
+
+asyncio.run(main())
