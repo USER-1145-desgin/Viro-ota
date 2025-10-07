@@ -84,8 +84,8 @@ while True:
         bat.show_picture('lowbat')
         time.sleep(3)
         deepsleep()
-    else:
-        print("Battery Voltage: {:.2f} V, Battery %: {}%".format(voltage, percent))
+    #else:
+        #print("Battery Voltage: {:.2f} V, Battery %: {}%".format(voltage, percent))
 
     # --- OTA display ---
     if update_available:
